@@ -7,8 +7,13 @@ import time
 import json
 import random
 
+LEAD = "leader"
+CAND = "candidate"
+FOLL = "follower"
+
 # Your ID number
 my_id = sys.argv[1]
+print(my_id)
 
 # The ID numbers of all the other replicas
 replica_ids = sys.argv[2:]
@@ -19,6 +24,35 @@ sock = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
 sock.connect(my_id)
 
 last = 0
+# log of potential things to apply
+log = []
+# store of key:value pairs ("applied")
+kvstore = dict()
+voted_for = None
+current_term = 0
+commit_index = 0
+last_applied = 0
+# Raft uses randomized election timeouts
+election_timeout = get_timeout()
+leader = "FFFF"
+current_role = FOLL
+
+
+def get_timeout():
+    # maybe use random.uniform?
+    pass
+
+# Elect a leader -> leader sends initial empty AppendEntires RPCs to all others
+#
+
+# Respond to messages based on your role (state of *this* instance/replica)
+# 1. Leader:
+# -
+
+# 2. Candidate:
+
+# 3. Follower:
+
 
 while True:
     ready = select.select([sock], [], [], 0.01)[0]
