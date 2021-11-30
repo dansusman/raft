@@ -15,6 +15,9 @@ FOLL = "follower"
 my_id = sys.argv[1]
 print(my_id)
 
+def get_timeout():
+    # maybe use random.uniform?
+    pass
 # The ID numbers of all the other replicas
 replica_ids = sys.argv[2:]
 
@@ -34,24 +37,25 @@ commit_index = 0
 last_applied = 0
 # Raft uses randomized election timeouts
 election_timeout = get_timeout()
-leader = "FFFF"
+leader = "0000"
 current_role = FOLL
 
 
-def get_timeout():
-    # maybe use random.uniform?
-    pass
 
 # Elect a leader -> leader sends initial empty AppendEntires RPCs to all others
 #
 
 # Respond to messages based on your role (state of *this* instance/replica)
 # 1. Leader:
-# -
+# - If receive "get," respond with
+# - If receive "put," commit to log/apply to store?
 
 # 2. Candidate:
+# -
 
 # 3. Follower:
+# - If receive "get," redirect to leader
+# - If receive "put," redirect to leader
 
 
 while True:
@@ -65,11 +69,7 @@ while True:
 
         msg = json.loads(msg_raw)
 
-        if msg['type'] == 'get':
-            message = {"src": my_id, "dst": msg['src'], "leader": "",
-                       "type": "fail", "MID": msg['MID']}
-            sock.send(json.dumps(msg))
-        elif msg['type'] == 'put':
+        if msg['type'] in ['get', 'put']:
             message = {"src": my_id, "dst": msg['src'], "leader": "",
                        "type": "fail", "MID": msg['MID']}
             sock.send(json.dumps(msg))
