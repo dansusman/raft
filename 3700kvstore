@@ -32,12 +32,12 @@ while True:
         msg = json.loads(msg_raw)
 
         if msg['type'] == 'get':
-            message = {"src": "<ID>", "dst": "<ID>", "leader": "<ID>",
-                       "type": "fail", "MID": "<a unique string>"}
+            message = {"src": my_id, "dst": msg['src'], "leader": "",
+                       "type": "fail", "MID": str(int(msg['MID'])+1)}
             sock.send(json.dumps(msg))
         elif msg['type'] == 'put':
-            message = {"src": "<ID>", "dst": "<ID>", "leader": "<ID>",
-                       "type": "fail", "MID": "<a unique string>"}
+            message = {"src": my_id, "dst": msg['src'], "leader": "",
+                       "type": "fail", "MID": str(int(msg['MID'])+1)}
             sock.send(json.dumps(msg))
         # Handle noop messages. This may be removed from your final implementation
         elif msg['type'] == 'noop':
