@@ -7,27 +7,60 @@ import socket
 import sys
 import time
 
+
+def get_new_elect_timeout():
+    """Gets a random election timeout."""
+    return random.uniform(0.1, 0.2)
+
+
+def get_current_time():
+    """Gets the current time."""
+    return time.time()
+
+
+# --------------- Types of Replicas ---------------
+LEAD = "leader"
+CAND = "candidate"
+FOLL = "follower"
+# --------------- Types of Messages ---------------
+RV = "req_vote"
+RVR = "req_vote_response"
+AE = "append_entries"
+
+# --------------- Global Stuff ---------------
+# TODO: last = 0
 # Your ID number
 my_id = sys.argv[1]
-
 # The ID numbers of all the other replicas
 replica_ids = sys.argv[2:]
-
+# store of key:value pairs ("applied")
+kvstore = dict()
+# log of operations to apply (GET/PUT) and term
+log = [{'op': None, 'term': 0}]
+voted_for = None
+current_term = 0
+commit_index = 0
+last_applied = 0
+next_idx = {}  # Reinitialized after election, index of the next log entry to send
+match_idx = {}  # Reinitialized after election, index of highest log entry known
+heartbeat = get_current_time()
+current_election_timeout = get_new_elect_timeout()
+leader = "FFFF"
+current_role = FOLL
+received_votes = 0  # number of votes for this replica to become leader
+# -------------------------------------------------
 # Connect to the network. All messages to/from other replicas and clients will
 # occur over this socket
 sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
 sock.connect(my_id)
 
-last = 0
-
 SELECT_WAIT_TIME = 0.01  # 10 milliseconds
 TERMINATOR = b'}\n'
 buffer = b''
 
-# Receive
-
 
 def recv_msgs(sock):
+    """Receive messages from the given socket."""
     global buffer
 
     fresh_buf = sock.recv(16384)
@@ -48,31 +81,153 @@ def recv_msgs(sock):
     return msgs
 
 
+def reached_timeout(time):
+    """Returns true if we have elapsed enough time to hit
+    the election timeout threshold.
+    """
+    return time - heartbeat > current_election_timeout
+
+
+def get_last_term():
+    """Returns the term of the last log entry."""
+    return log[len(log) - 1]["term"]
+
+
+def send_message(message):
+    sock.send(json.dumps(message).encode() + b'\n')
+    return True
+
+
+def send_request_votes():
+    """Send RequestVote RPC to each replica in the system."""
+    # term, candidateId, lastLogIndex, lastLogTerm
+    mes = {
+        "term": current_term,
+        "candidateId": my_id,
+        "lastLogIndex": len(log)-1,
+        "lastLogTerm": get_last_term(),
+        "src": my_id,
+        "leader": leader,
+        "type": RV
+    }
+    for replica in replica_ids:
+        mes["dst"] = replica
+        send_message(mes)
+
+
+def log_up_to_date(idx, term):
+    """Checks if candidate's log is at least as up-to-date as our log."""
+    return idx >= len(log)-1 and term >= get_last_term()
+
+
+def receive_request_votes(msg):
+    """Receive a RequestVote RPC message."""
+    # reply false if term < currentTerm
+    if current_role == FOLL:
+        term = msg["term"]
+        if term < current_term:
+            mes = {
+                "term": current_term,
+                "voteGranted": False,
+                "src": my_id,
+                "dst": msg["src"],
+                "leader": leader,
+                "type": RVR
+            }
+            send_message(mes)
+        elif (voted_for is None
+              or voted_for == msg["candidateId"]) and \
+                log_up_to_date(msg["lastLogIndex"], msg["lastLogTerm"]):
+            mes = {
+                "term": current_term,
+                "voteGranted": True,
+                "src": my_id,
+                "dst": msg["src"],
+                "leader": leader,
+                "type": RVR
+            }
+            send_message(mes)
+
+
+def send_empty_append_entries():
+    """Send out empty AppendEntries RPCs (heartbeat) to all replicas."""
+    global heartbeat
+    mes = {
+        "term": current_term,
+        "leaderId": my_id,
+        "prevLogIndex": len(log)-1,
+        "prevLogTerm": get_last_term(),
+        "entries": [],
+        "leaderCommit": commit_index,
+        "src": my_id,
+        "leader": leader,
+        "type": AE
+    }
+    for replica in replica_ids:
+        mes["dst"] = replica
+        send_message(mes)
+    heartbeat = get_current_time()
+
+
+def receive_append_entries(msg):
+    """Receive an AppendEntries RPC."""
+    pass
+
+
+def receive_req_vote_response(msg):
+    """Receive and handle a response to a RequestVote RPC."""
+    global received_votes, leader
+    if current_role == CAND:
+        if msg["voteGranted"]:
+            received_votes += 2
+            if received_votes >= len(replica_ids)/2:
+                leader = my_id
+                received_votes = 0
+                # send out empty AppendEntries RPC heartbeats
+                send_empty_append_entries()
+
+
+def trigger_election(time):
+    """Starts an election if a timeout is reached."""
+    global current_term, current_role, voted_for, current_election_timeout
+    if current_role != LEAD and reached_timeout(time):
+        # reset state
+        current_role = CAND
+        current_term += 1
+        voted_for = my_id
+        current_election_timeout = get_new_elect_timeout()
+        # send out "Vote for me!" messages
+        send_request_votes()
+
+
 while True:
     ready = select.select([sock], [], [], SELECT_WAIT_TIME)[0]
+
+    time = get_current_time()
+    trigger_election(time)
 
     if sock in ready:
         msgs = recv_msgs(sock)
 
         for msg in msgs:
-
             # For now, ignore get() and put() from clients
             if msg['type'] in ['get', 'put']:
-                pass
-
+                message = {"src": my_id, "dst": msg['src'], "leader": "",
+                           "type": "fail", "MID": msg['MID']}
+                sock.send(json.dumps(message))
             # Handle noop messages. This may be removed from your final implementation
             elif msg['type'] == 'noop':
                 print(f"{msg['dst']} received a NOOP from {msg['src']}")
 
-    clock = time.time()
-    if clock-last > 2:
-        # Send a no-op message to a random peer every two seconds, just for fun
-        # You definitely want to remove this from your implementation
-        msg = {'src': my_id, 'dst': random.choice(
-            replica_ids), 'leader': 'FFFF', 'type': 'noop'}
+    # clock = time.time()
+    # if clock-last > 2:
+    #     # Send a no-op message to a random peer every two seconds, just for fun
+    #     # You definitely want to remove this from your implementation
+    #     msg = {'src': my_id, 'dst': random.choice(
+    #         replica_ids), 'leader': 'FFFF', 'type': 'noop'}
 
-        # Make sure to end all messages with \n
-        sock.send(json.dumps(msg).encode() + b'\n')
+    #     # Make sure to end all messages with \n
+    #     sock.send(json.dumps(msg).encode() + b'\n')
 
-        print(f"{msg['src']} sending a NOOP to {msg['dst']}")
-        last = clock
+    #     print(f"{msg['src']} sending a NOOP to {msg['dst']}")
+    #     last = clock
