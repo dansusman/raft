@@ -1,0 +1,78 @@
+#!/usr/bin/env python3
+
+import json
+import random
+import select
+import socket
+import sys
+import time
+
+# Your ID number
+my_id = sys.argv[1]
+
+# The ID numbers of all the other replicas
+replica_ids = sys.argv[2:]
+
+# Connect to the network. All messages to/from other replicas and clients will
+# occur over this socket
+sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+sock.connect(my_id)
+
+last = 0
+
+SELECT_WAIT_TIME = 0.01  # 10 milliseconds
+TERMINATOR = b'}\n'
+buffer = b''
+
+# Receive
+
+
+def recv_msgs(sock):
+    global buffer
+
+    fresh_buf = sock.recv(16384)
+
+    # is this sock shutting down?
+    if len(fresh_buf) == 0:
+        return None
+
+    buffer += fresh_buf
+
+    msgs = []
+    while TERMINATOR in buffer:
+        position = buffer.find(TERMINATOR) + len(TERMINATOR)
+        # -1 to remove the \n, which json.loads won't want
+        msgs.append(json.loads(buffer[:position - 1].decode()))
+        buffer = buffer[position:]
+
+    return msgs
+
+
+while True:
+    ready = select.select([sock], [], [], SELECT_WAIT_TIME)[0]
+
+    if sock in ready:
+        msgs = recv_msgs(sock)
+
+        for msg in msgs:
+
+            # For now, ignore get() and put() from clients
+            if msg['type'] in ['get', 'put']:
+                pass
+
+            # Handle noop messages. This may be removed from your final implementation
+            elif msg['type'] == 'noop':
+                print(f"{msg['dst']} received a NOOP from {msg['src']}")
+
+    clock = time.time()
+    if clock-last > 2:
+        # Send a no-op message to a random peer every two seconds, just for fun
+        # You definitely want to remove this from your implementation
+        msg = {'src': my_id, 'dst': random.choice(
+            replica_ids), 'leader': 'FFFF', 'type': 'noop'}
+
+        # Make sure to end all messages with \n
+        sock.send(json.dumps(msg).encode() + b'\n')
+
+        print(f"{msg['src']} sending a NOOP to {msg['dst']}")
+        last = clock
