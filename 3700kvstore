@@ -8,9 +8,9 @@ import sys
 import time
 
 
-def get_new_elect_timeout():
+def get_new_elect_timeout(lower, upper):
     """Gets a random election timeout."""
-    return random.uniform(0.1, 0.2)
+    return random.uniform(lower, upper)
 
 
 def get_current_time():
@@ -26,15 +26,19 @@ FOLL = "follower"
 RV = "req_vote"
 RVR = "req_vote_response"
 AE = "append_entries"
-
+AER = "ae_response"
+REDIR = "redirect"
+FAIL = "fail"
+OK = "ok"
+GET = "get"
+PUT = "put"
+NOOP = "noop"
 # --------------- Global Stuff ---------------
-# TODO: last = 0
-# Your ID number
-my_id = sys.argv[1]
-# The ID numbers of all the other replicas
-replica_ids = sys.argv[2:]
-# store of key:value pairs ("applied")
-kvstore = dict()
+# last = 0
+HEART_INTERVAL = 0.1  # frequency for sending our heartbeats, in seconds
+my_id = sys.argv[1]  # this replica's ID
+replica_ids = sys.argv[2:]  # The ID numbers of all the other replicas
+kvstore = dict()  # store of key:value pairs ("applied")
 # log of operations to apply (GET/PUT) and term
 log = [{'op': None, 'term': 0}]
 voted_for = None
@@ -44,10 +48,12 @@ last_applied = 0
 next_idx = {}  # Reinitialized after election, index of the next log entry to send
 match_idx = {}  # Reinitialized after election, index of highest log entry known
 heartbeat = get_current_time()
-current_election_timeout = get_new_elect_timeout()
-leader = "FFFF"
+current_election_timeout = get_new_elect_timeout(0.05, 0.1)
+NOLEAD = "FFFF"
+leader = NOLEAD
 current_role = FOLL
-received_votes = 0  # number of votes for this replica to become leader
+received_votes = set()  # votes for this replica to become leader
+pending_requests = []  # buffer of client requests (messages)
 # -------------------------------------------------
 # Connect to the network. All messages to/from other replicas and clients will
 # occur over this socket
@@ -85,7 +91,7 @@ def reached_timeout(time):
     """Returns true if we have elapsed enough time to hit
     the election timeout threshold.
     """
-    return time - heartbeat > current_election_timeout
+    return time - heartbeat >= current_election_timeout
 
 
 def get_last_term():
@@ -95,7 +101,6 @@ def get_last_term():
 
 def send_message(message):
     sock.send(json.dumps(message).encode() + b'\n')
-    return True
 
 
 def send_request_votes():
@@ -120,24 +125,34 @@ def log_up_to_date(idx, term):
     return idx >= len(log)-1 and term >= get_last_term()
 
 
+def send_false_rv(msg):
+    """Sends a False RequestVote RPC response."""
+    mes = {
+        "term": current_term,
+        "voteGranted": False,
+        "src": my_id,
+        "dst": msg["src"],
+        "leader": leader,
+        "type": RVR
+    }
+    send_message(mes)
+
+
 def receive_request_votes(msg):
     """Receive a RequestVote RPC message."""
+    global heartbeat
     # reply false if term < currentTerm
-    if current_role == FOLL:
+    if current_role != FOLL:
+        send_false_rv(msg)
+    else:
         term = msg["term"]
         if term < current_term:
-            mes = {
-                "term": current_term,
-                "voteGranted": False,
-                "src": my_id,
-                "dst": msg["src"],
-                "leader": leader,
-                "type": RVR
-            }
-            send_message(mes)
+            send_false_rv(msg)
         elif (voted_for is None
               or voted_for == msg["candidateId"]) and \
                 log_up_to_date(msg["lastLogIndex"], msg["lastLogTerm"]):
+            # reset timeout
+            heartbeat = get_current_time()
             mes = {
                 "term": current_term,
                 "voteGranted": True,
@@ -152,37 +167,76 @@ def receive_request_votes(msg):
 def send_empty_append_entries():
     """Send out empty AppendEntries RPCs (heartbeat) to all replicas."""
     global heartbeat
+    if current_role == LEAD:
+        mes = {
+            "term": current_term,
+            "prevLogIndex": len(log)-1,
+            "prevLogTerm": get_last_term(),
+            "entries": [],
+            "leaderCommit": commit_index,
+            "src": my_id,
+            "leader": leader,
+            "type": AE
+        }
+        for replica in replica_ids:
+            mes["dst"] = replica
+            send_message(mes)
+        # reset timeout
+        heartbeat = get_current_time()
+
+
+def reject_ae(msg):
+    """Reject an AppendEntries RPC."""
     mes = {
         "term": current_term,
-        "leaderId": my_id,
-        "prevLogIndex": len(log)-1,
-        "prevLogTerm": get_last_term(),
-        "entries": [],
-        "leaderCommit": commit_index,
+        "success": False,
         "src": my_id,
+        "dst": msg["src"],
         "leader": leader,
-        "type": AE
+        "type": AER
     }
-    for replica in replica_ids:
-        mes["dst"] = replica
-        send_message(mes)
-    heartbeat = get_current_time()
+    send_message(mes)
 
 
 def receive_append_entries(msg):
     """Receive an AppendEntries RPC."""
+    global heartbeat, leader, current_role
+    ''' If the leader’s term (included in its RPC) is at least
+    as large as the candidate’s current term, then the candidate
+    recognizes the leader as legitimate and returns to follower
+    state. If the term in the RPC is smaller than the candidate’s
+    current term, then the candidate rejects the RPC and con-
+    tinues in candidate state.'''
+    if current_role == CAND:
+        if msg["term"] >= current_term:
+            current_role = FOLL
+            leader = msg["leader"]
+        else:
+            reject_ae(msg)
+    if current_role == FOLL:
+        leader = msg["leader"]
+        # reset timeout
+        heartbeat = get_current_time()
+        if len(msg["entries"]) > 0:
+            # do stuff to our log
+            pass
+
+
+def receive_append_entries_response(msg):
+    """TODO:"""
     pass
 
 
 def receive_req_vote_response(msg):
     """Receive and handle a response to a RequestVote RPC."""
-    global received_votes, leader
+    global received_votes, leader, current_role
     if current_role == CAND:
         if msg["voteGranted"]:
-            received_votes += 2
-            if received_votes >= len(replica_ids)/2:
+            received_votes.add(msg["src"])
+            if len(received_votes) > len(replica_ids) / 2:
                 leader = my_id
-                received_votes = 0
+                current_role = LEAD
+                received_votes = set()
                 # send out empty AppendEntries RPC heartbeats
                 send_empty_append_entries()
 
@@ -192,32 +246,109 @@ def trigger_election(time):
     global current_term, current_role, voted_for, current_election_timeout
     if current_role != LEAD and reached_timeout(time):
         # reset state
+        received_votes = set()
         current_role = CAND
         current_term += 1
         voted_for = my_id
-        current_election_timeout = get_new_elect_timeout()
+        received_votes.add(my_id)
+        if leader == NOLEAD:
+            current_election_timeout = get_new_elect_timeout(0.05, 0.1)
+        else:
+            current_election_timeout = get_new_elect_timeout(0.3, 0.4)
+
         # send out "Vote for me!" messages
         send_request_votes()
+
+
+def handle_put(msg):
+    """Updates KVStore with new information and replies to client."""
+    kvstore[msg["key"]] = msg["value"]
+    mes = {
+        "src": my_id,
+        "dst": msg["src"],
+        "leader": leader,
+        "type": OK,
+        "MID": msg["MID"]
+    }
+    send_message(mes)
+
+
+def handle_get(msg):
+    """Attempts to retrieve value from KVStore and replies to client."""
+    mes = {
+        "src": my_id,
+        "dst": msg["src"],
+        "leader": leader,
+        "type": OK,
+        "MID": msg["MID"],
+        "value": ""
+    }
+    if kvstore.get(msg["key"]):
+        mes["value"] = kvstore.get(msg["key"])
+    send_message(mes)
+
+
+def handle_get_put(msg):
+    """Handle GET/PUT messages from clients."""
+    if current_role != LEAD:
+        # fail or redirect
+        if leader == NOLEAD:
+            if msg not in pending_requests:
+                pending_requests.append(msg)
+        else:
+            mes = {
+                "src": my_id,
+                "dst": msg["src"],
+                "leader": leader,
+                "MID": msg["MID"],
+                "type": REDIR
+            }
+            send_message(mes)
+    else:
+        log.append({"op": msg["type"], "term": current_term})
+        if msg["type"] == PUT:
+            handle_put(msg)
+        if msg["type"] == GET:
+            handle_get(msg)
+        # put in log entry where term = currentTerm
+        # opertaion = msg["type"]
+        # get: see if kvstore has the value we want and return if yes
+        # put: put info in kvstore if it doesn't already exist
+        # increment currentTerm
+        pass
+
+
+def dispatch(msg):
+    """Deals with message appropriately based on type."""
+    if msg['type'] in [GET, PUT]:
+        handle_get_put(msg)
+    elif msg["type"] == AE:
+        receive_append_entries(msg)
+    elif msg["type"] == AER:
+        receive_append_entries_response(msg)
+    elif msg["type"] == RV:
+        receive_request_votes(msg)
+    elif msg["type"] == RVR:
+        receive_req_vote_response(msg)
+    elif msg['type'] == NOOP:
+        print(f"{msg['dst']} received a NOOP from {msg['src']}")
 
 
 while True:
     ready = select.select([sock], [], [], SELECT_WAIT_TIME)[0]
 
-    time = get_current_time()
-    trigger_election(time)
+    curr_time = get_current_time()
+    trigger_election(curr_time)
+    if curr_time - heartbeat >= HEART_INTERVAL:
+        send_empty_append_entries()
 
     if sock in ready:
+        for request in pending_requests:
+            dispatch(request)
         msgs = recv_msgs(sock)
 
         for msg in msgs:
-            # For now, ignore get() and put() from clients
-            if msg['type'] in ['get', 'put']:
-                message = {"src": my_id, "dst": msg['src'], "leader": "",
-                           "type": "fail", "MID": msg['MID']}
-                sock.send(json.dumps(message))
-            # Handle noop messages. This may be removed from your final implementation
-            elif msg['type'] == 'noop':
-                print(f"{msg['dst']} received a NOOP from {msg['src']}")
+            dispatch(msg)
 
     # clock = time.time()
     # if clock-last > 2:
