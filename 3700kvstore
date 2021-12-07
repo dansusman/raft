@@ -46,7 +46,7 @@ current_term = 0
 commit_index = 0
 last_applied = 0
 next_idx = {}  # Reinitialized after election, index of the next log entry to send
-match_idx = {}  # Reinitialized after election, index of highest log entry known
+match_idx = {}  # Reinitialized after election, index of highest log entry known to be replicated
 heartbeat = get_current_time()
 current_election_timeout = get_new_elect_timeout(0.05, 0.1)
 NOLEAD = "FFFF"
@@ -185,22 +185,38 @@ def send_empty_append_entries():
         heartbeat = get_current_time()
 
 
-def reject_ae(msg):
-    """Reject an AppendEntries RPC."""
+def send_ae_response(msg, success):
+    """Send a response to an AppendEntries RPC."""
     mes = {
         "term": current_term,
-        "success": False,
+        "success": success,
         "src": my_id,
         "dst": msg["src"],
         "leader": leader,
-        "type": AER
+        "type": AER,
+        "lengthLog": len(log)
     }
     send_message(mes)
 
 
+def send_append_entries():
+    """Send AppendEntries RPC with content (non-empty, non-heartbeats)."""
+    # probably need to use next_index, etc.
+    # TODO:
+    pass
+
+
+def validate_log(msg):
+    """Returns true if log contains an entry at prevLogIndex whose
+    term matches prevLogTerm."""
+    prev_idx = msg["prevLogIndex"]
+    prev_term = msg["prevLogTerm"]
+    return log[prev_idx]["term"] == prev_term
+
+
 def receive_append_entries(msg):
     """Receive an AppendEntries RPC."""
-    global heartbeat, leader, current_role
+    global heartbeat, leader, current_role, log, commit_index
     ''' If the leader’s term (included in its RPC) is at least
     as large as the candidate’s current term, then the candidate
     recognizes the leader as legitimate and returns to follower
@@ -212,19 +228,44 @@ def receive_append_entries(msg):
             current_role = FOLL
             leader = msg["leader"]
         else:
-            reject_ae(msg)
+            send_ae_response(msg, False)
     if current_role == FOLL:
         leader = msg["leader"]
         # reset timeout
         heartbeat = get_current_time()
         if len(msg["entries"]) > 0:
-            # do stuff to our log
-            pass
+            # this is not a heartbeat, respond to sender
+            if msg["term"] < current_term or not validate_log(msg):
+                send_ae_response(msg, False)
+            else:
+                current_i = msg["leaderCommit"] + 1
+                for i in range(msg["leaderCommit"] + 1, len(log) - 1):
+                    current_i = i
+                    if msg["entries"][i - (msg["leaderCommit"] + 1)]["term"] != log[i]["term"]:
+                        # delete existing and all that follow from current log
+                        log = log[:i]
+                        break
+                log.append(msg["entries"][current_i -
+                           (msg["leaderCommit"] + 1):])
+                if msg["leaderCommit"] > commit_index:
+                    commit_index = min(msg["leaderCommit"], len(log) - 1)
+                    send_ae_response(msg, True)
 
 
 def receive_append_entries_response(msg):
-    """TODO:"""
-    pass
+    """Handle an incoming AE Response message (of type AER)."""
+    global next_idx, match_idx
+    if current_role == LEAD:
+        if msg["success"]:
+            next_idx[msg["src"]] = msg["lengthLog"]
+            match_idx[msg["src"]] = msg["lengthLog"] - 1
+        else:
+            next_idx[msg["src"]] -= 1
+            # retry TODO:
+            send_append_entries()
+
+    else:
+        print("Received AER at non-leader replica.")
 
 
 def receive_req_vote_response(msg):
