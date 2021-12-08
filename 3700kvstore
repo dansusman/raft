@@ -54,6 +54,8 @@ leader = NOLEAD
 current_role = FOLL
 received_votes = set()  # votes for this replica to become leader
 pending_requests = []  # buffer of client requests (messages)
+# map from log entry index to follower successes for that message
+replicated_entries = {}
 # -------------------------------------------------
 # Connect to the network. All messages to/from other replicas and clients will
 # occur over this socket
@@ -164,7 +166,7 @@ def receive_request_votes(msg):
             send_message(mes)
 
 
-def send_empty_append_entries():
+def send_append_entries(entries=[]):
     """Send out empty AppendEntries RPCs (heartbeat) to all replicas."""
     global heartbeat
     if current_role == LEAD:
@@ -172,7 +174,7 @@ def send_empty_append_entries():
             "term": current_term,
             "prevLogIndex": len(log)-1,
             "prevLogTerm": get_last_term(),
-            "entries": [],
+            "entries": entries,
             "leaderCommit": commit_index,
             "src": my_id,
             "leader": leader,
@@ -194,16 +196,10 @@ def send_ae_response(msg, success):
         "dst": msg["src"],
         "leader": leader,
         "type": AER,
-        "lengthLog": len(log)
+        "lengthLog": len(log),
+        "entries": msg["entries"]
     }
     send_message(mes)
-
-
-def send_append_entries():
-    """Send AppendEntries RPC with content (non-empty, non-heartbeats)."""
-    # probably need to use next_index, etc.
-    # TODO:
-    pass
 
 
 def validate_log(msg):
@@ -211,7 +207,7 @@ def validate_log(msg):
     term matches prevLogTerm."""
     prev_idx = msg["prevLogIndex"]
     prev_term = msg["prevLogTerm"]
-    return log[prev_idx]["term"] == prev_term
+    return prev_idx < len(log) and log[prev_idx]["term"] == prev_term
 
 
 def receive_append_entries(msg):
@@ -223,6 +219,8 @@ def receive_append_entries(msg):
     state. If the term in the RPC is smaller than the candidate’s
     current term, then the candidate rejects the RPC and con-
     tinues in candidate state.'''
+    # reset timeout
+    heartbeat = get_current_time()
     if current_role == CAND:
         if msg["term"] >= current_term:
             current_role = FOLL
@@ -231,8 +229,6 @@ def receive_append_entries(msg):
             send_ae_response(msg, False)
     if current_role == FOLL:
         leader = msg["leader"]
-        # reset timeout
-        heartbeat = get_current_time()
         if len(msg["entries"]) > 0:
             # this is not a heartbeat, respond to sender
             if msg["term"] < current_term or not validate_log(msg):
@@ -248,7 +244,17 @@ def receive_append_entries(msg):
                 log.append(msg["entries"][current_i -
                            (msg["leaderCommit"] + 1):])
                 if msg["leaderCommit"] > commit_index:
-                    commit_index = min(msg["leaderCommit"], len(log) - 1)
+                    temp_comIdx = min(msg["leaderCommit"], len(log) - 1)
+                    for i in range(commit_index, temp_comIdx):
+                        operation = log[i]["op"]["type"]
+                        # put - there already: return; not there: send AE
+                        if operation == PUT:
+                            # already present in our store and no change needed
+                            handle_put(log[i]["op"])
+                        else:
+                            print(
+                                "Error, AE received with incorrect type:", operation)
+                    commit_index = temp_comIdx
                     send_ae_response(msg, True)
 
 
@@ -257,15 +263,30 @@ def receive_append_entries_response(msg):
     global next_idx, match_idx
     if current_role == LEAD:
         if msg["success"]:
-            next_idx[msg["src"]] = msg["lengthLog"]
-            match_idx[msg["src"]] = msg["lengthLog"] - 1
+            next_idx.setdefault(msg["src"], msg["lengthLog"])
+            match_idx.setdefault(msg["src"], msg["lengthLog"] - 1)
+            # increase count of successes
+            for entry in msg["entries"]:
+                value = replicated_entries.get(entry, 0)
+                replicated_entries[entry] = value + 1
+                if (value + 1) > len(replica_ids) / 2:
+                    apply_entry(entry)
         else:
             next_idx[msg["src"]] -= 1
-            # retry TODO:
-            send_append_entries()
+            send_append_entries(msg["entries"])
 
     else:
         print("Received AER at non-leader replica.")
+
+
+def apply_entry(entry):
+    """Applies a given entry to the kvstore."""
+    message = entry["op"]
+    operation = message["type"]
+    if operation == GET:
+        handle_get(msg)
+    if operation == PUT:
+        handle_put(msg)
 
 
 def receive_req_vote_response(msg):
@@ -275,17 +296,22 @@ def receive_req_vote_response(msg):
         if msg["voteGranted"]:
             received_votes.add(msg["src"])
             if len(received_votes) > len(replica_ids) / 2:
+                print("WE HAVE A WINNER", my_id)
                 leader = my_id
                 current_role = LEAD
                 received_votes = set()
+                for replica in replica_ids:
+                    next_idx.setdefault(replica, len(log))
+                    match_idx.setdefault(replica, 0)
                 # send out empty AppendEntries RPC heartbeats
-                send_empty_append_entries()
+                send_append_entries()
 
 
 def trigger_election(time):
     """Starts an election if a timeout is reached."""
     global current_term, current_role, voted_for, current_election_timeout
     if current_role != LEAD and reached_timeout(time):
+        # print("ELECTION TRIGGERED BY", my_id)
         # reset state
         received_votes = set()
         current_role = CAND
@@ -346,32 +372,35 @@ def handle_get_put(msg):
             }
             send_message(mes)
     else:
-        log.append({"op": msg["type"], "term": current_term})
-        if msg["type"] == PUT:
-            handle_put(msg)
-        if msg["type"] == GET:
+        operation = msg["type"]
+        # get - there already: return; not there: send empty
+        if operation == GET:
             handle_get(msg)
-        # put in log entry where term = currentTerm
-        # opertaion = msg["type"]
-        # get: see if kvstore has the value we want and return if yes
-        # put: put info in kvstore if it doesn't already exist
-        # increment currentTerm
-        pass
+        # put - there already: return; not there: send AE
+        if operation == PUT:
+            if msg["key"] in kvstore and kvstore[msg["key"]] == msg["value"]:
+                # already present in our store and no change needed
+                handle_put(msg)
+            else:
+                # add to leader log and send AE
+                log.append({"op": msg, "term": current_term})
+                send_append_entries(log[len(log) - 2:])
 
 
 def dispatch(msg):
     """Deals with message appropriately based on type."""
-    if msg['type'] in [GET, PUT]:
+    msg_type = msg["type"]
+    if msg_type in [GET, PUT]:
         handle_get_put(msg)
-    elif msg["type"] == AE:
+    elif msg_type == AE:
         receive_append_entries(msg)
-    elif msg["type"] == AER:
+    elif msg_type == AER:
         receive_append_entries_response(msg)
-    elif msg["type"] == RV:
+    elif msg_type == RV:
         receive_request_votes(msg)
-    elif msg["type"] == RVR:
+    elif msg_type == RVR:
         receive_req_vote_response(msg)
-    elif msg['type'] == NOOP:
+    elif msg_type == NOOP:
         print(f"{msg['dst']} received a NOOP from {msg['src']}")
 
 
@@ -381,7 +410,7 @@ while True:
     curr_time = get_current_time()
     trigger_election(curr_time)
     if curr_time - heartbeat >= HEART_INTERVAL:
-        send_empty_append_entries()
+        send_append_entries()
 
     if sock in ready:
         for request in pending_requests:
