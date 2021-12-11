@@ -188,7 +188,10 @@ def send_append_entries(entries):
             mes["dst"] = replica
             prev_idx = next_idx[replica] - 1
             mes["prevLogIndex"] = prev_idx
-            mes["prevLogTerm"] = log[prev_idx]["term"]
+            if prev_idx < len(log):
+                mes["prevLogTerm"] = log[prev_idx]["term"]
+            else:
+                mes["prevLogTerm"] = 0
             send_message(mes)
         # reset timeout
         heartbeat = get_current_time()
@@ -214,7 +217,6 @@ def validate_log(msg):
     term matches prevLogTerm."""
     prev_idx = msg["prevLogIndex"]
     prev_term = msg["prevLogTerm"]
-    print(len(log), prev_idx)
     return prev_idx < len(log) and log[prev_idx]["term"] == prev_term
 
 
@@ -240,13 +242,13 @@ def receive_append_entries(msg):
                 current_i = msg["leaderCommit"] + 1
                 for i in range(msg["leaderCommit"] + 1, len(log) - 1):
                     current_i = i
-                    print(current_i)
-                    # TODO: this has some error ("TypeError: list indices must be integers or slices, not str")
+                    if i > len(msg["entries"]):
+                        break
                     if msg["entries"][i - (msg["leaderCommit"] + 1)]["term"] != log[i]["term"]:
                         # delete existing and all that follow from current log
                         log = log[:i]
                         break
-                log.append(msg["entries"][current_i -
+                log.extend(msg["entries"][current_i -
                            (msg["leaderCommit"] + 1):])
                 if msg["leaderCommit"] > commit_index:
                     temp_comIdx = min(msg["leaderCommit"], len(log) - 1)
