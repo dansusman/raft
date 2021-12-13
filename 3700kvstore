@@ -53,6 +53,7 @@ for replica in replica_ids:
     match_idx.setdefault(replica, 0)
     next_idx.setdefault(replica, 1)
 heartbeat = get_current_time()
+timeout = get_current_time()
 current_election_timeout = get_new_elect_timeout(0.05, 0.1)
 NOLEAD = "FFFF"
 leader = NOLEAD
@@ -100,12 +101,12 @@ def reached_timeout(time):
     """
     if current_role == LEAD:
         return False
-    return time - heartbeat >= current_election_timeout
+    return time - timeout >= current_election_timeout
 
 
 def get_last_term():
     """Returns the term of the last log entry."""
-    return log[len(log) - 1]["term"]
+    return log[-1]["term"]
 
 
 def send_message(message):
@@ -132,7 +133,10 @@ def send_request_votes():
 
 def log_up_to_date(idx, term):
     """Checks if candidate's log is at least as up-to-date as our log."""
-    return idx >= len(log)-1 and term >= get_last_term()
+    if get_last_term() != term:
+        return get_last_term() <= term
+    else:
+        return len(log)-1 <= idx
 
 
 def send_false_rv(msg):
@@ -152,18 +156,16 @@ def receive_request_votes(msg):
     """Receive a RequestVote RPC message."""
     global heartbeat, voted_for, leader
     # reply false if term < currentTerm
-    if current_role != FOLL:
+    # if current_role != FOLL:
+    #     send_false_rv(msg)
+    # else:
+    term = msg["term"]
+    if term < current_term:
         send_false_rv(msg)
     else:
-        term = msg["term"]
-        if term < current_term:
-            send_false_rv(msg)
-        elif (voted_for is None
-              or voted_for == msg["candidateId"]) and \
-                log_up_to_date(msg["lastLogIndex"], msg["lastLogTerm"]):
-            # reset timeout
-            heartbeat = get_current_time()
-            voted_for = msg["candidateId"]
+        if log_up_to_date(msg["lastLogIndex"], msg["lastLogTerm"]) and \
+                (voted_for is None or voted_for == msg["src"]):
+            voted_for = msg["src"]
             mes = {
                 "term": current_term,
                 "voteGranted": True,
@@ -173,6 +175,19 @@ def receive_request_votes(msg):
                 "type": RVR
             }
             send_message(mes)
+            reset_all_timeout()
+        else:
+            send_false_rv(msg)
+
+
+def reset_all_timeout():
+    """Resets global time related stuff."""
+    global current_election_timeout, timeout
+    if leader == NOLEAD:
+        current_election_timeout = get_new_elect_timeout(0.05, 0.1)
+    else:
+        current_election_timeout = get_new_elect_timeout(0.3, 0.4)
+    timeout = get_current_time()
 
 
 def send_append_entries(entries):
@@ -204,7 +219,7 @@ def send_append_entries(entries):
             mes["prevLogIndex"] = prev_idx
             mes["prevLogTerm"] = prev_term
             send_message(mes)
-        # reset timeout
+        # reset heartbeat
         heartbeat = get_current_time()
 
 
@@ -230,25 +245,21 @@ def validate_log(msg):
     term matches prevLogTerm."""
     prev_idx = msg["prevLogIndex"]
     prev_term = msg["prevLogTerm"]
-    return prev_idx < len(log) and log[prev_idx]["term"] == prev_term
+    return log[prev_idx]["term"] == prev_term
 
 
 def receive_append_entries(msg):
     """Receive an AppendEntries RPC."""
-    global heartbeat, leader, current_role, log, commit_index
+    global heartbeat, leader, current_role, log, commit_index, current_term, voted_for, received_votes
     prev_idx = msg["prevLogIndex"]
     prev_term = msg["prevLogTerm"]
-    if current_role == CAND:
-        if msg["term"] >= current_term:
-            # reset timeout
-            heartbeat = get_current_time()
-            current_role = FOLL
-            leader = msg["leader"]
-        else:
-            send_ae_response(msg, False, prev_idx)
-    if current_role == FOLL:
+    if msg["term"] >= current_term:
+        current_role = FOLL
         leader = msg["leader"]
-        heartbeat = get_current_time()
+        current_term = msg["term"]
+        voted_for = None
+        received_votes = set()
+        reset_all_timeout()
 
         if prev_idx > (len(log) - 1):
             send_ae_response(msg, False, prev_idx)
@@ -260,8 +271,11 @@ def receive_append_entries(msg):
                 if next_idx <= (len(log) - 1):
                     del log[next_idx:]
                 log.extend(msg["entries"])
-                send_ae_response(msg, True, prev_idx)
+            send_ae_response(msg, True, prev_idx)
             commit_index = min((len(log) - 1), msg["leaderCommit"])
+            apply_entries()
+    else:
+        send_ae_response(msg, False, prev_idx)
 
 
 def receive_append_entries_response(msg):
@@ -278,7 +292,7 @@ def receive_append_entries_response(msg):
             # set commitIndex = N
             if commit_index < capital_n and log[capital_n]["term"] == current_term:
                 # TODO: failing index out of range ^^
-                # entries = log[commit_index + 1: capital_n + 1]
+                entries = log[commit_index + 1: capital_n + 1]
                 commit_index = capital_n
                 apply_entries()
 
@@ -301,9 +315,10 @@ def apply_entries():
 def apply_log(entries):
     """Adds given PUT entries to the store."""
     for entry in entries:
-        if entry["term"] == current_term:
-            if entry["op"] == PUT:
-                handle_put(entry)
+        if entry["op"] == PUT:
+            handle_put(entry)
+        elif entry["op"] is None:
+            pass
 
 
 def receive_req_vote_response(msg):
@@ -312,7 +327,7 @@ def receive_req_vote_response(msg):
     if current_role == CAND:
         if msg["voteGranted"]:
             received_votes.add(msg["src"])
-            if len(received_votes) > (len(replica_ids) // 2) + 1:
+            if len(received_votes) >= ((len(replica_ids) + 1) // 2) + 1:
                 print("WE HAVE A WINNER", my_id)
                 leader = my_id
                 current_role = LEAD
@@ -322,25 +337,22 @@ def receive_req_vote_response(msg):
                 for replica in replica_ids:
                     next_idx[replica] = commit_index + 1
                     match_idx[replica] = 0
+                apply_entries()
                 # send out empty AppendEntries RPC heartbeats
                 send_append_entries([])
 
 
 def trigger_election(time):
     """Starts an election if a timeout is reached."""
-    global current_term, current_role, voted_for, current_election_timeout
+    global current_term, current_role, voted_for, current_election_timeout, leader, received_votes
     if current_role != LEAD and reached_timeout(time):
         # reset state
-        received_votes = set()
         current_role = CAND
+        leader = NOLEAD
+        reset_all_timeout()
         current_term += 1
         voted_for = my_id
-        received_votes.add(my_id)
-        if leader == NOLEAD:
-            current_election_timeout = get_new_elect_timeout(0.05, 0.1)
-        else:
-            current_election_timeout = get_new_elect_timeout(0.3, 0.4)
-
+        received_votes = set((my_id),)
         # send out "Vote for me!" messages
         send_request_votes()
 
@@ -423,6 +435,8 @@ def dispatch(msg):
         receive_req_vote_response(msg)
     elif msg_type == NOOP:
         print(f"{msg['dst']} received a NOOP from {msg['src']}")
+    else:
+        print("Something Bad Happened! Unknown message type:", msg_type)
 
 
 while True:
@@ -434,16 +448,11 @@ while True:
         send_append_entries([])
 
     if sock in ready:
-        # if len(pending_requests) > 0:
-        #     dispatch(pending_requests.pop())
+        msgs = recv_msgs(sock)
+        pending_requests.extend(msgs)
         for request in pending_requests:
             dispatch(request)
-
-        msgs = recv_msgs(sock)
-
-        # pending_requests.extend(msgs)
-        for msg in msgs:
-            dispatch(msg)
+        pending_requests = []
 
     # clock = time.time()
     # if clock-last > 2:
