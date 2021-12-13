@@ -37,7 +37,7 @@ PUT = "put"
 NOOP = "noop"
 # --------------- Global Stuff ---------------
 # last = 0
-HEART_INTERVAL = 0.1  # frequency for sending our heartbeats, in seconds
+HEART_INTERVAL = 0.5  # frequency for sending our heartbeats, in seconds
 my_id = sys.argv[1]  # this replica's ID
 replica_ids = sys.argv[2:]  # The ID numbers of all the other replicas
 kvstore = dict()  # store of key:value pairs ("applied")
@@ -54,7 +54,7 @@ for replica in replica_ids:
     next_idx.setdefault(replica, 1)
 heartbeat = get_current_time()
 timeout = get_current_time()
-current_election_timeout = get_new_elect_timeout(0.05, 0.1)
+current_election_timeout = get_new_elect_timeout(0.7, 1)
 NOLEAD = "FFFF"
 leader = NOLEAD
 current_role = FOLL
@@ -184,9 +184,9 @@ def reset_all_timeout():
     """Resets global time related stuff."""
     global current_election_timeout, timeout
     if leader == NOLEAD:
-        current_election_timeout = get_new_elect_timeout(0.05, 0.1)
+        current_election_timeout = get_new_elect_timeout(0.7, 1)
     else:
-        current_election_timeout = get_new_elect_timeout(0.3, 0.4)
+        current_election_timeout = get_new_elect_timeout(1, 1.2)
     timeout = get_current_time()
 
 
@@ -205,16 +205,6 @@ def send_append_entries(entries):
         for replica in replica_ids:
             mes["dst"] = replica
             prev_idx = next_idx[replica] - 1
-            if prev_idx not in range(len(log)):
-                # TODO: failing (index out of range)
-                # advanced-2.json is failing pretty consistently
-                # we are passing correctness on some, not all
-                # failing performance on almost everything
-                # need to fix PUTs because many unanswered client PUTs
-                # packet storming a lot, failing tests instantly about 50% of the time
-                print(prev_idx)
-                print(log)
-                print(len(log))
             prev_term = log[prev_idx]["term"]
             mes["prevLogIndex"] = prev_idx
             mes["prevLogTerm"] = prev_term
@@ -273,6 +263,7 @@ def receive_append_entries(msg):
                 log.extend(msg["entries"])
             send_ae_response(msg, True, prev_idx)
             commit_index = min((len(log) - 1), msg["leaderCommit"])
+
             apply_entries()
     else:
         send_ae_response(msg, False, prev_idx)
@@ -291,7 +282,6 @@ def receive_append_entries_response(msg):
             # of matchIndex[i] ≥ N, and log[N].term == currentTerm:
             # set commitIndex = N
             if commit_index < capital_n and log[capital_n]["term"] == current_term:
-                # TODO: failing index out of range ^^
                 entries = log[commit_index + 1: capital_n + 1]
                 commit_index = capital_n
                 apply_entries()
@@ -363,15 +353,16 @@ def handle_put(msg):
         kvstore[msg["key"]] = msg["value"]
     else:
         kvstore.setdefault(msg["key"], msg["value"])
-    mes = {
-        "src": my_id,
-        "dst": msg["src"],
-        "leader": leader,
-        "type": OK,
-        "MID": msg["MID"],
-        "value": msg["value"]
-    }
-    send_message(mes)
+    if current_role == LEAD:
+        mes = {
+            "src": my_id,
+            "dst": msg["src"],
+            "leader": leader,
+            "type": OK,
+            "MID": msg["MID"],
+            "value": msg["value"]
+        }
+        send_message(mes)
 
 
 def handle_get(msg):
@@ -466,3 +457,28 @@ while True:
 
     #     print(f"{msg['src']} sending a NOOP to {msg['dst']}")
     #     last = clock
+
+
+"""
+TODO:
+
+1. Too many messages/Latency
+    - buffer? (https://github.dev/Jakexx360/CS3700/blob/master/project5/3700kvstore)
+    - alter timeout/heartbeat intervals?
+
+2. PUTs/GETS
+    - GETs sometimes returns incorrectly stored value
+    - Only after leader crash? => see #3
+    - print state of log and store all the time and see what is wrong
+
+3. Leader crash -> incorrect data
+    - upon leader change, ensure data transfers over properly
+
+4. Partitions
+    - Hopefully fixed with leader recovery
+    - See Piazza?
+    - Cry
+
+5. 
+
+"""
