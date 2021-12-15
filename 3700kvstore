@@ -20,6 +20,11 @@ def get_current_time():
     return time.time()
 
 
+def quorum():
+    """Gets the number of replicas that forms a quorum."""
+    return (alive_replicas // 2) + 1
+
+
 # --------------- Types of Replicas ---------------
 LEAD = "leader"
 CAND = "candidate"
@@ -62,6 +67,8 @@ received_votes = set()  # votes for this replica to become leader
 pending_requests = []  # buffer of client requests (messages)
 # map from log entry index to follower successes for that message
 replicated_entries = {}
+alive_replicas = len(replica_ids) + 1
+successful_leaders = 0
 # -------------------------------------------------
 # Connect to the network. All messages to/from other replicas and clients will
 # occur over this socket
@@ -200,7 +207,9 @@ def send_append_entries(entries):
             "leaderCommit": commit_index,
             "src": my_id,
             "leader": leader,
-            "type": AE
+            "type": AE,
+            "alive": alive_replicas,
+            "leads": successful_leaders
         }
         for replica in replica_ids:
             mes["dst"] = replica
@@ -240,11 +249,13 @@ def validate_log(msg):
 
 def receive_append_entries(msg):
     """Receive an AppendEntries RPC."""
-    global heartbeat, leader, current_role, log, commit_index, current_term, voted_for, received_votes
+    global heartbeat, leader, current_role, log, commit_index, current_term, voted_for, received_votes, alive_replicas, successful_leaders
     prev_idx = msg["prevLogIndex"]
     prev_term = msg["prevLogTerm"]
     if msg["term"] >= current_term:
         current_role = FOLL
+        alive_replicas = msg["alive"]
+        successful_leaders = msg["leads"]
         leader = msg["leader"]
         current_term = msg["term"]
         voted_for = None
@@ -263,7 +274,6 @@ def receive_append_entries(msg):
                 log.extend(msg["entries"])
             send_ae_response(msg, True, prev_idx)
             commit_index = min((len(log) - 1), msg["leaderCommit"])
-
             apply_entries()
     else:
         send_ae_response(msg, False, prev_idx)
@@ -277,7 +287,7 @@ def receive_append_entries_response(msg):
             match_idx[msg["src"]] = msg["prevLogIdx"] + len(msg["entries"])
             next_idx[msg["src"]] = match_idx[msg["src"]] + 1
             sorted_match_idx = list(sorted(match_idx.values()))
-            capital_n = sorted_match_idx[-((len(replica_ids) + 1) // 2)]
+            capital_n = sorted_match_idx[-(quorum() - 1)]
             # If there exists an N such that N > commitIndex, a majority
             # of matchIndex[i] ≥ N, and log[N].term == currentTerm:
             # set commitIndex = N
@@ -313,15 +323,16 @@ def apply_log(entries):
 
 def receive_req_vote_response(msg):
     """Receive and handle a response to a RequestVote RPC."""
-    global received_votes, leader, current_role, heartbeat
+    global received_votes, leader, current_role, heartbeat, successful_leaders
     if current_role == CAND:
         if msg["voteGranted"]:
             received_votes.add(msg["src"])
-            if len(received_votes) >= ((len(replica_ids) + 1) // 2) + 1:
+            if len(received_votes) >= quorum():
                 print("WE HAVE A WINNER", my_id)
                 leader = my_id
                 current_role = LEAD
                 received_votes = set()
+                successful_leaders += 1
                 # reset timeout
                 heartbeat = get_current_time()
                 for replica in replica_ids:
@@ -334,8 +345,10 @@ def receive_req_vote_response(msg):
 
 def trigger_election(time):
     """Starts an election if a timeout is reached."""
-    global current_term, current_role, voted_for, current_election_timeout, leader, received_votes
+    global current_term, current_role, voted_for, current_election_timeout, leader, received_votes, alive_replicas
     if current_role != LEAD and reached_timeout(time):
+        if successful_leaders > 0:
+            alive_replicas -= 1
         # reset state
         current_role = CAND
         leader = NOLEAD
@@ -445,22 +458,14 @@ while True:
             dispatch(request)
         pending_requests = []
 
-    # clock = time.time()
-    # if clock-last > 2:
-    #     # Send a no-op message to a random peer every two seconds, just for fun
-    #     # You definitely want to remove this from your implementation
-    #     msg = {'src': my_id, 'dst': random.choice(
-    #         replica_ids), 'leader': 'FFFF', 'type': 'noop'}
-
-    #     # Make sure to end all messages with \n
-    #     sock.send(json.dumps(msg).encode() + b'\n')
-
-    #     print(f"{msg['src']} sending a NOOP to {msg['dst']}")
-    #     last = clock
-
-
 """
 TODO:
+
+Updated:
+1. PUTs
+2. Latency
+3. Partition Logic
+4. Leader Failures
 
 1. Too many messages/Latency
     - buffer? (https://github.dev/Jakexx360/CS3700/blob/master/project5/3700kvstore)
@@ -477,7 +482,6 @@ TODO:
 4. Partitions
     - Hopefully fixed with leader recovery
     - See Piazza?
-    - Cry
 
 5. 
 
