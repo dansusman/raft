@@ -69,6 +69,9 @@ pending_requests = []  # buffer of client requests (messages)
 replicated_entries = {}
 alive_replicas = len(replica_ids) + 1
 successful_leaders = 0
+replica_clocks = {}
+for replica in replica_ids:
+    replica_clocks.setdefault(replica, 0)
 # -------------------------------------------------
 # Connect to the network. All messages to/from other replicas and clients will
 # occur over this socket
@@ -76,6 +79,7 @@ sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
 sock.connect(my_id)
 
 SELECT_WAIT_TIME = 0.01  # 10 milliseconds
+SEND_WAIT_TIME = 0.025  # 25 milliseconds
 TERMINATOR = b'}\n'
 buffer = b''
 
@@ -143,7 +147,7 @@ def log_up_to_date(idx, term):
     if get_last_term() != term:
         return get_last_term() <= term
     else:
-        return len(log)-1 <= idx
+        return len(log) - 1 <= idx
 
 
 def send_false_rv(msg):
@@ -197,7 +201,7 @@ def reset_all_timeout():
     timeout = get_current_time()
 
 
-def send_append_entries(entries):
+def send_append_entries(entries, prev_idx=0):
     """Send out AppendEntries RPCs to all replicas."""
     global heartbeat
     if current_role == LEAD:
@@ -209,7 +213,8 @@ def send_append_entries(entries):
             "leader": leader,
             "type": AE,
             "alive": alive_replicas,
-            "leads": successful_leaders
+            "leads": successful_leaders,
+            "prevLogIndex": prev_idx
         }
         for replica in replica_ids:
             mes["dst"] = replica
@@ -220,6 +225,33 @@ def send_append_entries(entries):
             send_message(mes)
         # reset heartbeat
         heartbeat = get_current_time()
+
+
+def send_batched_entries():
+    """Sends out AE RPCs in batches of 100 to replicas."""
+    if current_role == LEAD:
+        for replica in replica_ids:
+            prev_idx = next_idx[replica] - 1
+            prev_term = log[prev_idx]["term"]
+            entries = log[prev_idx + 1:]
+            entries = entries[:100]
+            timeframe = get_current_time() - replica_clocks[replica]
+            if timeframe > SEND_WAIT_TIME and match_idx[replica] < len(log) - 1:
+                replica_clocks[replica] = get_current_time()
+                mes = {
+                    "term": current_term,
+                    "entries": entries,
+                    "leaderCommit": commit_index,
+                    "src": my_id,
+                    "leader": leader,
+                    "type": AE,
+                    "alive": alive_replicas,
+                    "leads": successful_leaders,
+                    "prevLogIndex": prev_idx,
+                    "dst": replica,
+                    "prevLogTerm": prev_term
+                }
+                send_message(mes)
 
 
 def send_ae_response(msg, success, prevLogIdx=0, prevLogTerm=0):
@@ -287,7 +319,7 @@ def receive_append_entries_response(msg):
             match_idx[msg["src"]] = msg["prevLogIdx"] + len(msg["entries"])
             next_idx[msg["src"]] = match_idx[msg["src"]] + 1
             sorted_match_idx = list(sorted(match_idx.values()))
-            capital_n = sorted_match_idx[-(quorum() - 1)]
+            capital_n = sorted_match_idx[-((len(replica_ids) + 1) // 2)]
             # If there exists an N such that N > commitIndex, a majority
             # of matchIndex[i] ≥ N, and log[N].term == currentTerm:
             # set commitIndex = N
@@ -298,7 +330,7 @@ def receive_append_entries_response(msg):
 
         else:
             next_idx[msg["src"]] = max(1, next_idx[msg['src']] - 1)
-            send_append_entries(msg["entries"])
+            send_append_entries(msg["entries"], msg["prevLogIdx"])
 
     else:
         print("Received AER at non-leader replica.")
@@ -410,7 +442,6 @@ def handle_get_put(msg):
                     "value": msg["value"],
                 }
                 log.append(entry)
-                send_append_entries([entry])
         else:
             handle_get(msg)
     else:
@@ -444,19 +475,36 @@ def dispatch(msg):
 
 
 while True:
-    ready = select.select([sock], [], [], SELECT_WAIT_TIME)[0]
 
+    # # try to respond to previous messages
+    # for message in client_buff:
+    #     dispatch(message)
+    # for message in replica_buff:
+    #     dispatch(message)
+
+    # check for election timeouts
     curr_time = get_current_time()
     trigger_election(curr_time)
     if curr_time - heartbeat >= HEART_INTERVAL:
         send_append_entries([])
 
+    send_batched_entries()
+
+    # check for open socket
+    ready = select.select([sock], [], [], SELECT_WAIT_TIME)[0]
+
+    # grab and dispatch new messages
     if sock in ready:
         msgs = recv_msgs(sock)
         pending_requests.extend(msgs)
-        for request in pending_requests:
-            dispatch(request)
-        pending_requests = []
+        for _ in range(2):
+            if len(pending_requests) > 0:
+                dispatch(pending_requests.pop(0))
+
+        # for request in pending_requests:
+        #     dispatch(request)
+        # pending_requests = []
+
 
 """
 TODO:
