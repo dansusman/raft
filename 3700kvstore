@@ -506,31 +506,4 @@ while True:
         # pending_requests = []
 
 
-"""
-TODO:
-
-Updated:
-1. PUTs
-2. Latency
-3. Partition Logic
-4. Leader Failures
-
-1. Too many messages/Latency
-    - buffer? (https://github.dev/Jakexx360/CS3700/blob/master/project5/3700kvstore)
-    - alter timeout/heartbeat intervals?
-
-2. PUTs/GETS
-    - GETs sometimes returns incorrectly stored value
-    - Only after leader crash? => see #3
-    - print state of log and store all the time and see what is wrong
-
-3. Leader crash -> incorrect data
-    - upon leader change, ensure data transfers over properly
-
-4. Partitions
-    - Hopefully fixed with leader recovery
-    - See Piazza?
-
-5. 
-
-"""
+# TODO: Partitions are broken, everything else 1111 or 0110 (advanced seems to be 2111 or 2010)
