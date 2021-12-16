@@ -42,7 +42,7 @@ PUT = "put"
 NOOP = "noop"
 # --------------- Global Stuff ---------------
 # last = 0
-HEART_INTERVAL = 0.5  # frequency for sending our heartbeats, in seconds
+HEART_INTERVAL = 0.65  # frequency for sending our heartbeats, in seconds
 my_id = sys.argv[1]  # this replica's ID
 replica_ids = sys.argv[2:]  # The ID numbers of all the other replicas
 kvstore = dict()  # store of key:value pairs ("applied")
@@ -254,7 +254,7 @@ def send_batched_entries():
                 send_message(mes)
 
 
-def send_ae_response(msg, success, prevLogIdx=0, prevLogTerm=0):
+def send_ae_response(msg, success, prevLogIdx=0, prevLogTerm=0, firstTermIdx=0):
     """Send a response to an AppendEntries RPC."""
     mes = {
         "term": current_term,
@@ -268,15 +268,57 @@ def send_ae_response(msg, success, prevLogIdx=0, prevLogTerm=0):
         "prevLogTerm": prevLogTerm,
         "entries": msg["entries"]
     }
+    if not success:
+        mes["firstTermIdx"] = firstTermIdx
     send_message(mes)
 
 
 def validate_log(msg):
     """Returns true if log contains an entry at prevLogIndex whose
-    term matches prevLogTerm."""
+    term matches prevLogTerm.
+    """
     prev_idx = msg["prevLogIndex"]
     prev_term = msg["prevLogTerm"]
     return log[prev_idx]["term"] == prev_term
+
+
+def send_fail(msg):
+    mes = {
+        "src": my_id,
+        "dst": msg["src"],
+        "leader": leader,
+        "type": FAIL,
+        "MID": msg["MID"],
+        "value": msg["value"]
+    }
+    send_message(mes)
+
+
+def handle_received_msg(msg):
+    """Checks if transition to follower is necessary. Applies change
+    if needed.
+    """
+    global current_role, leader, current_term, voted_for, received_votes
+    if "term" in msg and msg["term"] > current_term:
+        if current_role == LEAD and log[commit_index + 1:]:
+            for entry in log[commit_index + 1:]:
+                if entry["op"] is not None:
+                    send_fail(entry)
+        current_role = FOLL
+        leader = msg["leader"]
+        current_term = msg["term"]
+        voted_for = None
+        received_votes = set()
+        reset_all_timeout()
+
+
+def find_first(prev_idx):
+    if prev_idx > len(log) - 1:
+        return len(log) - 1
+    else:
+        for i, ent in enumerate(log):
+            if ent["term"] == log[prev_idx]["term"]:
+                return i
 
 
 def receive_append_entries(msg):
@@ -284,7 +326,13 @@ def receive_append_entries(msg):
     global heartbeat, leader, current_role, log, commit_index, current_term, voted_for, received_votes, alive_replicas, successful_leaders
     prev_idx = msg["prevLogIndex"]
     prev_term = msg["prevLogTerm"]
-    if msg["term"] >= current_term:
+    if prev_idx > (len(log) - 1):
+        send_ae_response(msg, False, prev_idx,
+                         firstTermIdx=find_first(prev_idx))
+    if not validate_log(msg):
+        send_ae_response(msg, False, prev_idx,
+                         firstTermIdx=find_first(prev_idx))
+    elif msg["term"] >= current_term:
         current_role = FOLL
         alive_replicas = msg["alive"]
         successful_leaders = msg["leads"]
@@ -293,22 +341,17 @@ def receive_append_entries(msg):
         voted_for = None
         received_votes = set()
         reset_all_timeout()
-
-        if prev_idx > (len(log) - 1):
-            send_ae_response(msg, False, prev_idx)
-        elif not validate_log(msg):
-            send_ae_response(msg, False, prev_idx)
-        else:
-            if len(msg["entries"]) > 0:
-                next_idx = prev_idx + 1
-                if next_idx <= (len(log) - 1):
-                    del log[next_idx:]
-                log.extend(msg["entries"])
-            send_ae_response(msg, True, prev_idx)
-            commit_index = min((len(log) - 1), msg["leaderCommit"])
-            apply_entries()
+        if len(msg["entries"]) > 0:
+            next_idx = prev_idx + 1
+            if next_idx <= (len(log) - 1):
+                del log[next_idx:]
+            log.extend(msg["entries"])
+        send_ae_response(msg, True, prev_idx)
+        commit_index = min((len(log) - 1), msg["leaderCommit"])
+        apply_entries()
     else:
-        send_ae_response(msg, False, prev_idx)
+        send_ae_response(msg, False, prev_idx,
+                         firstTermIdx=find_first(prev_idx))
 
 
 def receive_append_entries_response(msg):
@@ -328,12 +371,32 @@ def receive_append_entries_response(msg):
                 commit_index = capital_n
                 apply_entries()
 
-        else:
-            next_idx[msg["src"]] = max(1, next_idx[msg['src']] - 1)
-            send_append_entries(msg["entries"], msg["prevLogIdx"])
+                for entry in entries:
+                    if entry["term"] == current_term and entry["op"] == PUT:
+                        send_ok(entry)
 
-    else:
-        print("Received AER at non-leader replica.")
+        else:
+            if "firstTermIdx" in msg:
+                next_idx[msg['src']] = max(
+                    msg['firstTermIdx'], match_idx[msg['src']])
+            else:
+                next_idx[msg["src"]] = max(1, next_idx[msg['src']] - 1)
+            prev_idx = next_idx[replica] - 1
+            entries = log[prev_idx + 1:]
+            entries = entries[:100]
+            send_append_entries(entries, prev_idx)
+
+
+def send_ok(entry):
+    mes = {
+        "src": my_id,
+        "dst": entry["src"],
+        "leader": leader,
+        "type": OK,
+        "MID": entry["MID"],
+        "value": entry["value"]
+    }
+    send_message(mes)
 
 
 def apply_entries():
@@ -348,9 +411,7 @@ def apply_log(entries):
     """Adds given PUT entries to the store."""
     for entry in entries:
         if entry["op"] == PUT:
-            handle_put(entry)
-        elif entry["op"] is None:
-            pass
+            handle_put(entry, False)
 
 
 def receive_req_vote_response(msg):
@@ -392,13 +453,13 @@ def trigger_election(time):
         send_request_votes()
 
 
-def handle_put(msg):
+def handle_put(msg, send=True):
     """Updates KVStore with new information and replies to client."""
     if msg["key"] in kvstore:
         kvstore[msg["key"]] = msg["value"]
     else:
         kvstore.setdefault(msg["key"], msg["value"])
-    if current_role == LEAD:
+    if current_role == LEAD and send:
         mes = {
             "src": my_id,
             "dst": msg["src"],
@@ -459,10 +520,13 @@ def dispatch(msg):
     """Deals with message appropriately based on type."""
     msg_type = msg["type"]
     if msg_type in [GET, PUT]:
+        handle_received_msg(msg)
         handle_get_put(msg)
     elif msg_type == AE:
+        handle_received_msg(msg)
         receive_append_entries(msg)
     elif msg_type == AER:
+        handle_received_msg(msg)
         receive_append_entries_response(msg)
     elif msg_type == RV:
         receive_request_votes(msg)
@@ -490,6 +554,8 @@ while True:
 
     send_batched_entries()
 
+    apply_entries()
+
     # check for open socket
     ready = select.select([sock], [], [], SELECT_WAIT_TIME)[0]
 
@@ -497,13 +563,10 @@ while True:
     if sock in ready:
         msgs = recv_msgs(sock)
         pending_requests.extend(msgs)
-        for _ in range(2):
-            if len(pending_requests) > 0:
-                dispatch(pending_requests.pop(0))
+        # for _ in range(2):
+        #     if len(pending_requests) > 0:
+        #         dispatch(pending_requests.pop(0))
 
-        # for request in pending_requests:
-        #     dispatch(request)
-        # pending_requests = []
-
-
-# TODO: Partitions are broken, everything else 1111 or 0110 (advanced seems to be 2111 or 2010)
+        for request in pending_requests:
+            dispatch(request)
+        pending_requests = []
