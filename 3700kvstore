@@ -22,7 +22,7 @@ def get_current_time():
 
 def quorum():
     """Gets the number of replicas that forms a quorum."""
-    return (alive_replicas // 2) + 1
+    return (len(replica_ids) // 2) + 1
 
 
 # --------------- Types of Replicas ---------------
@@ -67,8 +67,6 @@ received_votes = set()  # votes for this replica to become leader
 pending_requests = []  # buffer of client requests (messages)
 # map from log entry index to follower successes for that message
 replicated_entries = {}
-alive_replicas = len(replica_ids) + 1
-successful_leaders = 0
 replica_clocks = {}
 for replica in replica_ids:
     replica_clocks.setdefault(replica, 0)
@@ -212,8 +210,6 @@ def send_append_entries(entries, prev_idx=0):
             "src": my_id,
             "leader": leader,
             "type": AE,
-            "alive": alive_replicas,
-            "leads": successful_leaders,
             "prevLogIndex": prev_idx
         }
         for replica in replica_ids:
@@ -245,8 +241,6 @@ def send_batched_entries():
                     "src": my_id,
                     "leader": leader,
                     "type": AE,
-                    "alive": alive_replicas,
-                    "leads": successful_leaders,
                     "prevLogIndex": prev_idx,
                     "dst": replica,
                     "prevLogTerm": prev_term
@@ -323,7 +317,7 @@ def find_first(prev_idx):
 
 def receive_append_entries(msg):
     """Receive an AppendEntries RPC."""
-    global heartbeat, leader, current_role, log, commit_index, current_term, voted_for, received_votes, alive_replicas, successful_leaders
+    global heartbeat, leader, current_role, log, commit_index, current_term, voted_for, received_votes
     prev_idx = msg["prevLogIndex"]
     prev_term = msg["prevLogTerm"]
     if prev_idx > (len(log) - 1):
@@ -334,8 +328,6 @@ def receive_append_entries(msg):
                          firstTermIdx=find_first(prev_idx))
     elif msg["term"] >= current_term:
         current_role = FOLL
-        alive_replicas = msg["alive"]
-        successful_leaders = msg["leads"]
         leader = msg["leader"]
         current_term = msg["term"]
         voted_for = None
@@ -416,7 +408,7 @@ def apply_log(entries):
 
 def receive_req_vote_response(msg):
     """Receive and handle a response to a RequestVote RPC."""
-    global received_votes, leader, current_role, heartbeat, successful_leaders
+    global received_votes, leader, current_role, heartbeat
     if current_role == CAND:
         if msg["voteGranted"]:
             received_votes.add(msg["src"])
@@ -425,7 +417,6 @@ def receive_req_vote_response(msg):
                 leader = my_id
                 current_role = LEAD
                 received_votes = set()
-                successful_leaders += 1
                 # reset timeout
                 heartbeat = get_current_time()
                 for replica in replica_ids:
@@ -438,10 +429,8 @@ def receive_req_vote_response(msg):
 
 def trigger_election(time):
     """Starts an election if a timeout is reached."""
-    global current_term, current_role, voted_for, current_election_timeout, leader, received_votes, alive_replicas
+    global current_term, current_role, voted_for, current_election_timeout, leader, received_votes
     if current_role != LEAD and reached_timeout(time):
-        if successful_leaders > 0:
-            alive_replicas -= 1
         # reset state
         current_role = CAND
         leader = NOLEAD
@@ -505,8 +494,6 @@ def handle_get_put(msg):
                 log.append(entry)
         else:
             handle_get(msg)
-    elif current_role == CAND:
-        send_fail(msg)
     else:
         mes = {
             "src": my_id,
