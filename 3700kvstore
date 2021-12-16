@@ -65,6 +65,7 @@ leader = NOLEAD
 current_role = FOLL
 received_votes = set()  # votes for this replica to become leader
 pending_requests = []  # buffer of client requests (messages)
+pending_gets = []  # buffer of client gets (messages)
 # map from log entry index to follower successes for that message
 replicated_entries = {}
 replica_clocks = {}
@@ -292,12 +293,15 @@ def handle_received_msg(msg):
     """Checks if transition to follower is necessary. Applies change
     if needed.
     """
-    global current_role, leader, current_term, voted_for, received_votes
+    global current_role, leader, current_term, voted_for, received_votes, pending_gets
     if "term" in msg and msg["term"] > current_term:
         if current_role == LEAD and log[commit_index + 1:]:
             for entry in log[commit_index + 1:]:
                 if entry["op"] is not None:
                     send_fail(entry)
+            for entry in pending_gets:
+                send_fail(entry)
+            pending_gets = []
         current_role = FOLL
         leader = msg["leader"]
         current_term = msg["term"]
@@ -319,7 +323,6 @@ def receive_append_entries(msg):
     """Receive an AppendEntries RPC."""
     global heartbeat, leader, current_role, log, commit_index, current_term, voted_for, received_votes
     prev_idx = msg["prevLogIndex"]
-    prev_term = msg["prevLogTerm"]
     if prev_idx > (len(log) - 1):
         send_ae_response(msg, False, prev_idx,
                          firstTermIdx=find_first(prev_idx))
@@ -340,7 +343,6 @@ def receive_append_entries(msg):
             log.extend(msg["entries"])
         send_ae_response(msg, True, prev_idx)
         commit_index = min((len(log) - 1), msg["leaderCommit"])
-        apply_entries()
     else:
         send_ae_response(msg, False, prev_idx,
                          firstTermIdx=find_first(prev_idx))
@@ -348,7 +350,7 @@ def receive_append_entries(msg):
 
 def receive_append_entries_response(msg):
     """Handle an incoming AE Response message (of type AER)."""
-    global next_idx, match_idx, commit_index
+    global next_idx, match_idx, commit_index, pending_gets
     if current_role == LEAD:
         if msg["success"]:
             match_idx[msg["src"]] = msg["prevLogIdx"] + len(msg["entries"])
@@ -366,6 +368,17 @@ def receive_append_entries_response(msg):
                 for entry in entries:
                     if entry["term"] == current_term and entry["op"] == PUT:
                         send_ok(entry)
+
+                filter_out = set()
+                for i, ent in enumerate(pending_gets):
+                    if ent["index"] <= capital_n:
+                        send_ok(ent)
+                        filter_out.add(i)
+                new_list = set()
+                for i, value in enumerate(pending_gets):
+                    if i not in filter_out:
+                        new_list.add(value)
+                pending_gets = list(new_list)
 
         else:
             if "firstTermIdx" in msg:
@@ -388,6 +401,7 @@ def send_ok(entry):
         "MID": entry["MID"],
         "value": entry["value"]
     }
+
     send_message(mes)
 
 
@@ -422,7 +436,7 @@ def receive_req_vote_response(msg):
                 for replica in replica_ids:
                     next_idx[replica] = commit_index + 1
                     match_idx[replica] = 0
-                apply_entries()
+                # apply_entries()
                 # send out empty AppendEntries RPC heartbeats
                 send_append_entries([])
 
@@ -492,8 +506,16 @@ def handle_get_put(msg):
                     "value": msg["value"],
                 }
                 log.append(entry)
-        else:
-            handle_get(msg)
+        elif msg["type"] == GET:
+            msg["index"] = commit_index
+            msg["currentTime"] = get_current_time()
+            if kvstore.get(msg["key"]):
+                msg["value"] = kvstore.get(msg["key"])
+            else:
+                msg["value"] = ""
+            pending_gets.append(msg)
+            if commit_index == len(log) - 1:
+                log.append({"op": None, "MID": NOOP, "term": current_term})
     else:
         mes = {
             "src": my_id,
@@ -525,6 +547,20 @@ def dispatch(msg):
         print(f"{msg['dst']} received a NOOP from {msg['src']}")
     else:
         print("Something Bad Happened! Unknown message type:", msg_type)
+
+
+def visit_gets():
+    global pending_gets
+    filter_out = set()
+    for i, ent in enumerate(pending_gets):
+        if (get_current_time() - ent["currentTime"]) > HEART_INTERVAL * 3:
+            send_fail(ent)
+            filter_out.add(i)
+    new_list = set()
+    for i, value in enumerate(pending_gets):
+        if i not in filter_out:
+            new_list.add(value)
+    pending_gets = list(new_list)
 
 
 while True:
