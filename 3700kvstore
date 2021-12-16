@@ -505,6 +505,8 @@ def handle_get_put(msg):
                 log.append(entry)
         else:
             handle_get(msg)
+    elif current_role == CAND:
+        send_fail(msg)
     else:
         mes = {
             "src": my_id,
