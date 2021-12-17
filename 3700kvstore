@@ -42,7 +42,7 @@ PUT = "put"
 NOOP = "noop"
 # --------------- Global Stuff ---------------
 # last = 0
-HEART_INTERVAL = 0.65  # frequency for sending our heartbeats, in seconds
+HEART_INTERVAL = 0.1  # frequency for sending our heartbeats, in seconds
 my_id = sys.argv[1]  # this replica's ID
 replica_ids = sys.argv[2:]  # The ID numbers of all the other replicas
 kvstore = dict()  # store of key:value pairs ("applied")
@@ -59,16 +59,16 @@ for replica in replica_ids:
     next_idx.setdefault(replica, 1)
 heartbeat = get_current_time()
 timeout = get_current_time()
-current_election_timeout = get_new_elect_timeout(0.7, 1)
+current_election_timeout = get_new_elect_timeout(0.25, 0.35)
 NOLEAD = "FFFF"
 leader = NOLEAD
 current_role = FOLL
 received_votes = set()  # votes for this replica to become leader
 pending_requests = []  # buffer of client requests (messages)
-pending_gets = []  # buffer of client gets (messages)
 # map from log entry index to follower successes for that message
 replicated_entries = {}
 replica_clocks = {}
+
 for replica in replica_ids:
     replica_clocks.setdefault(replica, 0)
 # -------------------------------------------------
@@ -164,29 +164,37 @@ def send_false_rv(msg):
 
 def receive_request_votes(msg):
     """Receive a RequestVote RPC message."""
-    global heartbeat, voted_for, leader
+    global voted_for, leader
     # reply false if term < currentTerm
     # if current_role != FOLL:
     #     send_false_rv(msg)
     # else:
     term = msg["term"]
     if term < current_term:
+        #print(my_id, "REJECTED VOTE FOR", msg["src"], "DUE TO OUT OF DATE TERM")
         send_false_rv(msg)
     else:
-        if log_up_to_date(msg["lastLogIndex"], msg["lastLogTerm"]) and \
-                (voted_for is None or voted_for == msg["src"]):
-            voted_for = msg["src"]
-            mes = {
-                "term": current_term,
-                "voteGranted": True,
-                "src": my_id,
-                "dst": msg["src"],
-                "leader": leader,
-                "type": RVR
-            }
-            send_message(mes)
-            reset_all_timeout()
+        if term > current_term:
+            voted_for = None
+        if log_up_to_date(msg["lastLogIndex"], msg["lastLogTerm"]):
+            if voted_for is None or voted_for == msg["src"]:
+                voted_for = msg["src"]
+                #print(my_id, "VOTED FOR", voted_for)
+                mes = {
+                    "term": current_term,
+                    "voteGranted": True,
+                    "src": my_id,
+                    "dst": msg["src"],
+                    "leader": leader,
+                    "type": RVR
+                }
+                send_message(mes)
+                reset_all_timeout()
+            else:                
+                #print(my_id, "REJECTED VOTE FOR", msg["src"], "DUE TO HAVING VOTED ALREADY")
+                send_false_rv(msg)
         else:
+            #print(my_id, "REJECTED VOTE FOR", msg["src"], "DUE TO OUT OF DATE LOG")
             send_false_rv(msg)
 
 
@@ -216,7 +224,11 @@ def send_append_entries(entries, prev_idx=0):
         for replica in replica_ids:
             mes["dst"] = replica
             prev_idx = next_idx[replica] - 1
-            prev_term = log[prev_idx]["term"]
+            if (prev_idx > len(log) - 1):
+                prev_term = log[len(log) - 1]["term"]
+                next_idx[replica] = len(log)
+            else:
+                prev_term = log[prev_idx]["term"]
             mes["prevLogIndex"] = prev_idx
             mes["prevLogTerm"] = prev_term
             send_message(mes)
@@ -225,13 +237,17 @@ def send_append_entries(entries, prev_idx=0):
 
 
 def send_batched_entries():
-    """Sends out AE RPCs in batches of 100 to replicas."""
+    """Sends out AE RPCs in batches of 128 to replicas."""
     if current_role == LEAD:
         for replica in replica_ids:
             prev_idx = next_idx[replica] - 1
-            prev_term = log[prev_idx]["term"]
+            if (prev_idx > len(log) - 1):
+                prev_term = log[len(log) - 1]["term"]
+                next_idx[replica] = len(log)
+            else:
+                prev_term = log[prev_idx]["term"]
             entries = log[prev_idx + 1:]
-            entries = entries[:100]
+            entries = entries[:128]
             timeframe = get_current_time() - replica_clocks[replica]
             if timeframe > SEND_WAIT_TIME and match_idx[replica] < len(log) - 1:
                 replica_clocks[replica] = get_current_time()
@@ -249,7 +265,7 @@ def send_batched_entries():
                 send_message(mes)
 
 
-def send_ae_response(msg, success, prevLogIdx=0, prevLogTerm=0, firstTermIdx=0):
+def send_ae_response(msg, success, prevLogIdx=0, prevLogTerm=0):
     """Send a response to an AppendEntries RPC."""
     mes = {
         "term": current_term,
@@ -263,8 +279,6 @@ def send_ae_response(msg, success, prevLogIdx=0, prevLogTerm=0, firstTermIdx=0):
         "prevLogTerm": prevLogTerm,
         "entries": msg["entries"]
     }
-    if not success:
-        mes["firstTermIdx"] = firstTermIdx
     send_message(mes)
 
 
@@ -274,6 +288,8 @@ def validate_log(msg):
     """
     prev_idx = msg["prevLogIndex"]
     prev_term = msg["prevLogTerm"]
+    if (prev_idx > len(log) - 1):
+        return False
     return log[prev_idx]["term"] == prev_term
 
 
@@ -293,15 +309,12 @@ def handle_received_msg(msg):
     """Checks if transition to follower is necessary. Applies change
     if needed.
     """
-    global current_role, leader, current_term, voted_for, received_votes, pending_gets
-    if "term" in msg and msg["term"] > current_term:
-        if current_role == LEAD and log[commit_index + 1:]:
-            for entry in log[commit_index + 1:]:
-                if entry["op"] is not None:
-                    send_fail(entry)
-            for entry in pending_gets:
-                send_fail(entry)
-            pending_gets = []
+    global current_role, leader, current_term, voted_for, received_votes
+    if "term" in msg and msg["term"] > current_term and "leaderCommit" in msg and commit_index <= msg["leaderCommit"]:
+        # if current_role == LEAD and log[commit_index + 1:]:
+        #     for entry in log[commit_index + 1:]:
+        #         if entry["op"] is not None:
+        #             send_fail(entry)
         current_role = FOLL
         leader = msg["leader"]
         current_term = msg["term"]
@@ -309,26 +322,18 @@ def handle_received_msg(msg):
         received_votes = set()
         reset_all_timeout()
 
-
-def find_first(prev_idx):
-    if prev_idx > len(log) - 1:
-        return len(log) - 1
-    else:
-        for i, ent in enumerate(log):
-            if ent["term"] == log[prev_idx]["term"]:
-                return i
-
-
 def receive_append_entries(msg):
     """Receive an AppendEntries RPC."""
-    global heartbeat, leader, current_role, log, commit_index, current_term, voted_for, received_votes
+    global leader, current_role, log, commit_index, current_term, voted_for, received_votes
     prev_idx = msg["prevLogIndex"]
     if prev_idx > (len(log) - 1):
-        send_ae_response(msg, False, prev_idx,
-                         firstTermIdx=find_first(prev_idx))
+        send_ae_response(msg, False, prev_idx) 
     if not validate_log(msg):
-        send_ae_response(msg, False, prev_idx,
-                         firstTermIdx=find_first(prev_idx))
+        send_ae_response(msg, False, prev_idx)
+    elif commit_index > msg["leaderCommit"]:
+        """helpful comment"""
+        #print("----------------REACHED HERE--------------", my_id, current_role)
+        send_ae_response(msg, False, prev_idx)
     elif msg["term"] >= current_term:
         current_role = FOLL
         leader = msg["leader"]
@@ -341,11 +346,10 @@ def receive_append_entries(msg):
             if next_idx <= (len(log) - 1):
                 del log[next_idx:]
             log.extend(msg["entries"])
-        send_ae_response(msg, True, prev_idx)
+            send_ae_response(msg, True, prev_idx)
         commit_index = min((len(log) - 1), msg["leaderCommit"])
     else:
-        send_ae_response(msg, False, prev_idx,
-                         firstTermIdx=find_first(prev_idx))
+        send_ae_response(msg, False, prev_idx)
 
 
 def receive_append_entries_response(msg):
@@ -360,7 +364,7 @@ def receive_append_entries_response(msg):
             # If there exists an N such that N > commitIndex, a majority
             # of matchIndex[i] ≥ N, and log[N].term == currentTerm:
             # set commitIndex = N
-            if commit_index < capital_n and log[capital_n]["term"] == current_term:
+            if capital_n < len(log) and commit_index < capital_n and log[capital_n]["term"] == current_term:
                 entries = log[commit_index + 1: capital_n + 1]
                 commit_index = capital_n
                 apply_entries()
@@ -369,27 +373,8 @@ def receive_append_entries_response(msg):
                     if entry["term"] == current_term and entry["op"] == PUT:
                         send_ok(entry)
 
-                filter_out = set()
-                for i, ent in enumerate(pending_gets):
-                    if ent["index"] <= capital_n:
-                        send_ok(ent)
-                        filter_out.add(i)
-                new_list = set()
-                for i, value in enumerate(pending_gets):
-                    if i not in filter_out:
-                        new_list.add(value)
-                pending_gets = list(new_list)
-
         else:
-            if "firstTermIdx" in msg:
-                next_idx[msg['src']] = max(
-                    msg['firstTermIdx'], match_idx[msg['src']])
-            else:
-                next_idx[msg["src"]] = max(1, next_idx[msg['src']] - 1)
-            prev_idx = next_idx[replica] - 1
-            entries = log[prev_idx + 1:]
-            entries = entries[:100]
-            send_append_entries(entries, prev_idx)
+            next_idx[msg["src"]] = max(1, next_idx[msg['src']] - 1)
 
 
 def send_ok(entry):
@@ -427,7 +412,7 @@ def receive_req_vote_response(msg):
         if msg["voteGranted"]:
             received_votes.add(msg["src"])
             if len(received_votes) >= quorum():
-                print("WE HAVE A WINNER", my_id)
+                print("WE HAVE A WINNER", my_id, len(received_votes), received_votes)
                 leader = my_id
                 current_role = LEAD
                 received_votes = set()
@@ -446,12 +431,15 @@ def trigger_election(time):
     global current_term, current_role, voted_for, current_election_timeout, leader, received_votes
     if current_role != LEAD and reached_timeout(time):
         # reset state
+        #print("TRIGGERED ELECTION", my_id)
         current_role = CAND
         leader = NOLEAD
         reset_all_timeout()
         current_term += 1
         voted_for = my_id
-        received_votes = set((my_id),)
+        received_votes = set()
+        received_votes.add(my_id)
+        #print("INITIAL VOTES:", received_votes)
         # send out "Vote for me!" messages
         send_request_votes()
 
@@ -506,16 +494,10 @@ def handle_get_put(msg):
                     "value": msg["value"],
                 }
                 log.append(entry)
-        elif msg["type"] == GET:
-            msg["index"] = commit_index
-            msg["currentTime"] = get_current_time()
-            if kvstore.get(msg["key"]):
-                msg["value"] = kvstore.get(msg["key"])
-            else:
-                msg["value"] = ""
-            pending_gets.append(msg)
-            if commit_index == len(log) - 1:
-                log.append({"op": None, "MID": NOOP, "term": current_term})
+        else:
+            handle_get(msg)
+    elif current_role == CAND or leader == NOLEAD:
+        pending_requests.append(msg)
     else:
         mes = {
             "src": my_id,
@@ -530,8 +512,10 @@ def handle_get_put(msg):
 def dispatch(msg):
     """Deals with message appropriately based on type."""
     msg_type = msg["type"]
+    # if current_role == LEAD:
+    #     print(my_id, len(log), commit_index, last_applied)
     if msg_type in [GET, PUT]:
-        handle_received_msg(msg)
+        # handle_received_msg(msg)
         handle_get_put(msg)
     elif msg_type == AE:
         handle_received_msg(msg)
@@ -547,21 +531,6 @@ def dispatch(msg):
         print(f"{msg['dst']} received a NOOP from {msg['src']}")
     else:
         print("Something Bad Happened! Unknown message type:", msg_type)
-
-
-def visit_gets():
-    global pending_gets
-    filter_out = set()
-    for i, ent in enumerate(pending_gets):
-        if (get_current_time() - ent["currentTime"]) > HEART_INTERVAL * 3:
-            send_fail(ent)
-            filter_out.add(i)
-    new_list = set()
-    for i, value in enumerate(pending_gets):
-        if i not in filter_out:
-            new_list.add(value)
-    pending_gets = list(new_list)
-
 
 while True:
 
@@ -588,10 +557,16 @@ while True:
     if sock in ready:
         msgs = recv_msgs(sock)
         pending_requests.extend(msgs)
-        # for _ in range(2):
-        #     if len(pending_requests) > 0:
-        #         dispatch(pending_requests.pop(0))
+        for _ in range(2):
+            if len(pending_requests) > 0:
+                dispatch(pending_requests.pop(0))
 
-        for request in pending_requests:
-            dispatch(request)
-        pending_requests = []
+        # for request in pending_requests:
+        #     dispatch(request)
+        # pending_requests = []
+
+
+# TODO:
+# adv-2 and adv-3 are failing - leader failures with dropped packets
+#
+#
