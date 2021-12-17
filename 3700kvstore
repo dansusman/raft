@@ -42,7 +42,7 @@ PUT = "put"
 NOOP = "noop"
 # --------------- Global Stuff ---------------
 # last = 0
-HEART_INTERVAL = 0.25  # frequency for sending our heartbeats, in seconds
+HEART_INTERVAL = 0.4  # frequency for sending our heartbeats, in seconds
 my_id = sys.argv[1]  # this replica's ID
 replica_ids = sys.argv[2:]  # The ID numbers of all the other replicas
 kvstore = dict()  # store of key:value pairs ("applied")
@@ -59,7 +59,7 @@ for replica in replica_ids:
     next_idx.setdefault(replica, 1)
 heartbeat = get_current_time()
 timeout = get_current_time()
-current_election_timeout = get_new_elect_timeout(0.3, 0.4)
+current_election_timeout = get_new_elect_timeout(0.5, 0.6)
 NOLEAD = "FFFF"
 leader = NOLEAD
 current_role = FOLL
@@ -202,9 +202,9 @@ def reset_all_timeout():
     """Resets global time related stuff."""
     global current_election_timeout, timeout
     if leader == NOLEAD:
-        current_election_timeout = get_new_elect_timeout(0.3, 0.4)
+        current_election_timeout = get_new_elect_timeout(0.5, 0.6)
     else:
-        current_election_timeout = get_new_elect_timeout(1, 1.2)
+        current_election_timeout = get_new_elect_timeout(0.7, 0.8)
     timeout = get_current_time()
 
 
