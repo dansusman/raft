@@ -42,7 +42,7 @@ PUT = "put"
 NOOP = "noop"
 # --------------- Global Stuff ---------------
 # last = 0
-HEART_INTERVAL = 0.1  # frequency for sending our heartbeats, in seconds
+HEART_INTERVAL = 0.25  # frequency for sending our heartbeats, in seconds
 my_id = sys.argv[1]  # this replica's ID
 replica_ids = sys.argv[2:]  # The ID numbers of all the other replicas
 kvstore = dict()  # store of key:value pairs ("applied")
@@ -59,7 +59,7 @@ for replica in replica_ids:
     next_idx.setdefault(replica, 1)
 heartbeat = get_current_time()
 timeout = get_current_time()
-current_election_timeout = get_new_elect_timeout(0.25, 0.35)
+current_election_timeout = get_new_elect_timeout(0.3, 0.4)
 NOLEAD = "FFFF"
 leader = NOLEAD
 current_role = FOLL
@@ -190,7 +190,7 @@ def receive_request_votes(msg):
                 }
                 send_message(mes)
                 reset_all_timeout()
-            else:                
+            else:
                 #print(my_id, "REJECTED VOTE FOR", msg["src"], "DUE TO HAVING VOTED ALREADY")
                 send_false_rv(msg)
         else:
@@ -202,7 +202,7 @@ def reset_all_timeout():
     """Resets global time related stuff."""
     global current_election_timeout, timeout
     if leader == NOLEAD:
-        current_election_timeout = get_new_elect_timeout(0.7, 1)
+        current_election_timeout = get_new_elect_timeout(0.3, 0.4)
     else:
         current_election_timeout = get_new_elect_timeout(1, 1.2)
     timeout = get_current_time()
@@ -322,12 +322,13 @@ def handle_received_msg(msg):
         received_votes = set()
         reset_all_timeout()
 
+
 def receive_append_entries(msg):
     """Receive an AppendEntries RPC."""
     global leader, current_role, log, commit_index, current_term, voted_for, received_votes
     prev_idx = msg["prevLogIndex"]
     if prev_idx > (len(log) - 1):
-        send_ae_response(msg, False, prev_idx) 
+        send_ae_response(msg, False, prev_idx)
     if not validate_log(msg):
         send_ae_response(msg, False, prev_idx)
     elif commit_index > msg["leaderCommit"]:
@@ -412,7 +413,8 @@ def receive_req_vote_response(msg):
         if msg["voteGranted"]:
             received_votes.add(msg["src"])
             if len(received_votes) >= quorum():
-                print("WE HAVE A WINNER", my_id, len(received_votes), received_votes)
+                print("WE HAVE A WINNER", my_id, len(
+                    received_votes), received_votes)
                 leader = my_id
                 current_role = LEAD
                 received_votes = set()
@@ -511,6 +513,7 @@ def handle_get_put(msg):
 
 def dispatch(msg):
     """Deals with message appropriately based on type."""
+    print(msg)
     msg_type = msg["type"]
     # if current_role == LEAD:
     #     print(my_id, len(log), commit_index, last_applied)
@@ -531,6 +534,7 @@ def dispatch(msg):
         print(f"{msg['dst']} received a NOOP from {msg['src']}")
     else:
         print("Something Bad Happened! Unknown message type:", msg_type)
+
 
 while True:
 
@@ -564,9 +568,3 @@ while True:
         # for request in pending_requests:
         #     dispatch(request)
         # pending_requests = []
-
-
-# TODO:
-# adv-2 and adv-3 are failing - leader failures with dropped packets
-#
-#
