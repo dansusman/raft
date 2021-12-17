@@ -413,8 +413,8 @@ def receive_req_vote_response(msg):
         if msg["voteGranted"]:
             received_votes.add(msg["src"])
             if len(received_votes) >= quorum():
-                print("WE HAVE A WINNER", my_id, len(
-                    received_votes), received_votes)
+                # print("WE HAVE A WINNER", my_id, len(
+                #     received_votes), received_votes)
                 leader = my_id
                 current_role = LEAD
                 received_votes = set()
@@ -513,7 +513,6 @@ def handle_get_put(msg):
 
 def dispatch(msg):
     """Deals with message appropriately based on type."""
-    print(msg)
     msg_type = msg["type"]
     # if current_role == LEAD:
     #     print(my_id, len(log), commit_index, last_applied)
