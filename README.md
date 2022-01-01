@@ -1,7 +1,8 @@
-# Project 6 - Dean Frame, Daniel Susman
+# Distributed Key-Value Database - Dean Frame, Daniel Susman
 
 This is the source code for Project 6 of CS3700 Networks and Distributed Systems.
-It holds the implementation of a Raft-based Key-Value Distributed Database.
+It holds the implementation of a Key-Value Distributed Database built with the principles
+of the Raft consensus protocol in mind.
 
 ## High Level Approach
 
